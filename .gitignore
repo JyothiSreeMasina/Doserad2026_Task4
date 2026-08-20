@@ -1,0 +1,30 @@
+# secrets
+Hugging Face Token.txt
+*.token
+*token*.txt
+
+# datasets, checkpoints, logs - large, and weights are uploaded to
+# Grand Challenge separately from the container (see docker/do_save.sh)
+# (leading slash: root-level only -- do NOT match src/data/, which is
+# real source code the Docker build needs)
+/data/
+/checkpoints/
+/logs/
+docker*/model/
+docker*/test-data/
+
+# packaged submission artifacts - GC builds the image itself from this
+# repo when linked, so the pre-built tarballs don't need to be tracked
+*.tar.gz
+
+# python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# latex build junk
+paper/*.aux
+paper/*.log
+
+# stray atomic-write leftovers (e.g. beam_encoder.py.tmp.253195.63f751fe8a42)
+*.tmp.[0-9]*

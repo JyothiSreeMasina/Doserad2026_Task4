@@ -1,0 +1,12 @@
+data/
+checkpoints/
+logs/
+notebooks/
+archive/
+.venv/
+__pycache__/
+*.pyc
+.git/
+Hugging Face Token.txt
+*.log
+docker/model/
