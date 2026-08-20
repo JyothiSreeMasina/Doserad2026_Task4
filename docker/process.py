@@ -137,9 +137,13 @@ def preprocess_ct(ct_image, target_spacing, target_shape):
 
 def restore_dose_to_original_grid(dose_tensor, minimum_cutoff, restore_cropper, sample, original_image):
     """dose_tensor: (D, H, W) float32 tensor on our internal (cropped/
-    padded, possibly resampled) grid. Returns an sitk.Image on
+    padded, possibly resampled) grid. Returns a (D, H, W) numpy array on
     `original_image`'s exact grid (size, spacing, origin, direction), with
-    `minimum_cutoff` applied.
+    `minimum_cutoff` applied. Returns a bare array rather than an sitk.Image
+    -- run() writes one control point at a time into a preallocated buffer
+    for the whole beam plan, so per-CP spacing/origin/direction metadata
+    would just be discarded immediately; see run()'s docstring comment on
+    why that buffer exists at all.
 
     Fast path: when spacing is unchanged (ResampleToSpacing was a no-op --
     true for every real patient checked so far, see PROGRESS_LOG.md), the
@@ -165,21 +169,20 @@ def restore_dose_to_original_grid(dose_tensor, minimum_cutoff, restore_cropper, 
 
     if spacing_matches:
         restored = restore_cropper.restore(dose_tensor.unsqueeze(0), original_shape_zyx).squeeze(0)
-        dose_img = sitk.GetImageFromArray(restored.cpu().numpy())
-        dose_img.CopyInformation(original_image)
-        return dose_img
+        return restored.cpu().numpy()
 
     dose_img = sitk.GetImageFromArray(dose_tensor.cpu().numpy())
     dose_img.SetSpacing(tuple(reversed(sample["ct_spacing"])))
     dose_img.SetOrigin(sample["ct_origin"])
     dose_img.SetDirection(original_image.GetDirection())
-    return sitk.Resample(
+    resampled = sitk.Resample(
         dose_img,
         referenceImage=original_image,
         interpolator=sitk.sitkLinear,
         defaultPixelValue=0.0,
         outputPixelType=sitk.sitkFloat32,
     )
+    return sitk.GetArrayFromImage(resampled)
 
 
 @torch.no_grad()
@@ -197,6 +200,17 @@ def predict_control_point(model, encoder, ct_tensor, beam, cp, device, dose_scal
     return (pred.squeeze(0).squeeze(0) / dose_scale).float()  # (D, H, W), stays on device
 
 
+def _direction_3d_to_4d(direction3):
+    """Extends a 3x3 row-major direction tuple to the 4x4 sitk expects for a
+    4D image -- the extra axis (control point index) is always identity."""
+    return (
+        direction3[0], direction3[1], direction3[2], 0.0,
+        direction3[3], direction3[4], direction3[5], 0.0,
+        direction3[6], direction3[7], direction3[8], 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    )
+
+
 def run(model, cfg, device):
     dcfg = cfg["data"]
     target_shape = tuple(dcfg["target_shape"])
@@ -210,7 +224,7 @@ def run(model, cfg, device):
     print(f"Loaded metadata for {len(metadata)} image(s)")
 
     restore_cropper = CenterCropOrPad(target_shape=target_shape)
-    per_output = [dict() for _ in range(NUM_OUTPUT_FILES)]  # idx_in_output -> sitk.Image
+    written_slots = set()
 
     for image_entry in metadata:
         image_idx = image_entry["image_file_idx"]
@@ -225,6 +239,23 @@ def run(model, cfg, device):
         encoder = PhotonBeamEncoder(volume_shape, sample["ct_spacing"], sample["ct_origin"])
         encoder.to(device)
 
+        all_cps = [(beam, cp) for beam in image_entry["beams"] for cp in beam["control_points"]]
+        # All control points for one image share a single output slot (the
+        # interface is 1 CT image -> 1 stacked dose map) -- preallocate one
+        # buffer sized for the whole beam plan and fill it in place, instead
+        # of keeping one sitk.Image per control point around until a final
+        # JoinSeries (which itself duplicates everything again into a new
+        # buffer). A real plan can have 100+ control points; holding them
+        # all at once was OOM-killing the container on large plans (see
+        # PROGRESS_LOG.md) even though our own 4-CP local test never hit it.
+        output_file_idx = all_cps[0][1]["output_info"]["output_file_idx"]
+        for _, cp in all_cps:
+            assert cp["output_info"]["output_file_idx"] == output_file_idx, \
+                "expected every control point for one image to share one output slot"
+        stack_size = max(cp["output_info"]["idx_in_output"] for _, cp in all_cps) + 1
+        shape_zyx = tuple(reversed(original_image.GetSize()))
+        buffer = np.zeros((stack_size, *shape_zyx), dtype=np.float32)
+
         n_beams = len(image_entry["beams"])
         for beam in image_entry["beams"]:
             n_cps = len(beam["control_points"])
@@ -233,31 +264,40 @@ def run(model, cfg, device):
                 output_info = cp["output_info"]
                 minimum_cutoff = float(output_info["minimum_cutoff"])
                 dose_tensor = predict_control_point(model, encoder, ct_tensor, beam, cp, device, dose_scale, amp)
-                dose_img = restore_dose_to_original_grid(
+                buffer[output_info["idx_in_output"]] = restore_dose_to_original_grid(
                     dose_tensor, minimum_cutoff, restore_cropper, sample, original_image
                 )
-                per_output[output_info["output_file_idx"]][output_info["idx_in_output"]] = dose_img
         print(f"Image {image_idx + 1}: {n_beams} beam(s) done")
 
+        output_dir = OUTPUT_PATH / f"images/stacked-radiation-dose-map-{output_file_idx + 1}"
+        os.makedirs(output_dir, exist_ok=True)
+        # isVector=False is required here: GetImageFromArray's default
+        # isVector auto-detection treats a 4D array's last axis as vector
+        # components rather than a spatial/stack axis, silently collapsing
+        # this to a 3D image and dropping the control-point axis entirely
+        # -- confirmed empirically, not documented behavior worth trusting
+        # blindly.
+        stacked = sitk.GetImageFromArray(buffer, isVector=False)
+        del buffer
+        stacked.SetSpacing(tuple(original_image.GetSpacing()) + (1.0,))
+        stacked.SetOrigin(tuple(original_image.GetOrigin()) + (0.0,))
+        stacked.SetDirection(_direction_3d_to_4d(original_image.GetDirection()))
+        sitk.WriteImage(stacked, output_dir / "output.mha", useCompression=False)
+        print(f"Wrote output slot {output_file_idx + 1}: {stack_size} slice(s)")
+        del stacked
+        written_slots.add(output_file_idx)
+
     for output_index in range(NUM_OUTPUT_FILES):
-        slot = per_output[output_index]
+        if output_index in written_slots:
+            continue
         output_dir = OUTPUT_PATH / f"images/stacked-radiation-dose-map-{output_index + 1}"
         os.makedirs(output_dir, exist_ok=True)
-
-        if not slot:
-            # Genuine 4D (1,1,1,1) placeholder -- matches the instructions' literal
-            # example and keeps every output slot the same dimensionality as a real
-            # one (always built via JoinSeries below). A bare sitk.Image(1, 1, ...)
-            # would silently be a 2D (1,1) image instead (SimpleITK's 2-size-arg
-            # constructor), not the 1x1x1x1 the spec shows.
-            placeholder = sitk.JoinSeries([sitk.Image(1, 1, 1, sitk.sitkFloat32)])
-            sitk.WriteImage(placeholder, output_dir / "output.mha")
-            continue
-
-        stack_size = max(slot) + 1
-        dose_slices = [slot[i] for i in range(stack_size)]
-        stacked = sitk.JoinSeries(dose_slices)
-        sitk.WriteImage(stacked, output_dir / "output.mha", useCompression=False)
-        print(f"Wrote output slot {output_index + 1}: {stack_size} slice(s)")
+        # Genuine 4D (1,1,1,1) placeholder -- matches the instructions' literal
+        # example and keeps every output slot the same dimensionality as a real
+        # one (always built via JoinSeries below). A bare sitk.Image(1, 1, ...)
+        # would silently be a 2D (1,1) image instead (SimpleITK's 2-size-arg
+        # constructor), not the 1x1x1x1 the spec shows.
+        placeholder = sitk.JoinSeries([sitk.Image(1, 1, 1, sitk.sitkFloat32)])
+        sitk.WriteImage(placeholder, output_dir / "output.mha")
 
     return 0
