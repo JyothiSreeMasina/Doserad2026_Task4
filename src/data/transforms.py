@@ -16,6 +16,7 @@ coordinates) would silently decouple the input geometry from the target
 dose. Only intensity-only augmentation is safe without that extra geometry
 bookkeeping, so that's what's provided.
 """
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -258,9 +259,15 @@ class NormalizeMR:
 
     def __call__(self, sample):
         mr = sample["ct"]
-        hi = torch.quantile(mr.flatten().float(), self.clip_percentile / 100.0)
-        hi = torch.clamp(hi, min=1e-6)  # guard a degenerate all-zero volume
-        mr = torch.clamp(mr, 0.0, hi.item())
+        # torch.quantile has a hard 2^24-element cap (errors with "input
+        # tensor is too large") -- fine for Task 2's photon grid (256^3 ~=
+        # 16.7M) but Task 4's proton grid (176x512x512 ~= 46.1M) blows past
+        # it. np.percentile has no such limit and this already runs
+        # CPU-side in a DataLoader worker, so there's no extra device
+        # transfer cost to switching.
+        hi = float(np.percentile(mr.numpy(), self.clip_percentile))
+        hi = max(hi, 1e-6)  # guard a degenerate all-zero volume
+        mr = torch.clamp(mr, 0.0, hi)
         sample["ct"] = mr / hi
         return sample
 

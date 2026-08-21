@@ -8,15 +8,15 @@ CT (so preprocessing uses BodyMaskMR/NormalizeMR, not BodyMask/NormalizeCT
 docstrings), and this loads configs/task2_photon_mr.yaml /
 checkpoints/task2_photon_mr instead of task1's.
 
-** UNVERIFIED PLATFORM DETAIL -- READ BEFORE BUILDING FOR REAL SUBMISSION **
-CT_DIR_BASE and METADATA_JSON_NAME below are inferred by analogy with Task
-1's actual (platform-confirmed) socket names, swapping "ct" for "mr" in the
-image directory name. This has NOT been verified against the real Photon/MR
-algorithm's interface definition on grand-challenge.org -- Claude in Chrome
-was unavailable this session (Remote Control connection limitation), so
-there was no way to browse the actual interface page. Confirm both
-constants against the live "Photon Dose on MR" algorithm's inputs/outputs
-before trusting a submission built from this file. See PROGRESS_LOG.md.
+CT_DIR_BASE is now confirmed against the real Preliminary Testing Phase
+submission page (2026-08-20): the interface lists "Radiation-Dose
+Calculation Source MRI Image 1..10" -- "MRI", not the "MR" this file
+originally guessed by blind analogy with Task 1's CT socket name. Slug
+format follows Task 1's actual platform-confirmed convention (title
+lowercased/hyphenated), same as it did for the CT case. Still not
+runtime-verified by an actual submission (this'll be the first one), so
+if a real /invoke ever fails to find its input files, check this
+constant against the interface page again before assuming anything else.
 """
 import glob
 import json
@@ -38,8 +38,8 @@ CONFIG_PATH = Path("/opt/app/configs/task2_photon_mr.yaml")
 MODEL_DIR = Path("/opt/ml/model")
 
 NUM_OUTPUT_FILES = 10
-CT_DIR_BASE = "radiation-dose-calculation-source-mr-image"  # UNVERIFIED -- see module docstring
-METADATA_JSON_NAME = "stacked-photon-beam-level-metadata"  # assumed shared with Task 1 (same beam JSON schema) -- UNVERIFIED
+CT_DIR_BASE = "radiation-dose-calculation-source-mri-image"  # confirmed against live interface page 2026-08-20 -- "MRI" not "MR"
+METADATA_JSON_NAME = "stacked-photon-beam-level-metadata"  # confirmed shared with Task 1 -- same text shown on this phase's interface list
 
 
 def load_config():
@@ -128,7 +128,9 @@ def preprocess_mr(mr_image, target_spacing, target_shape):
 def restore_dose_to_original_grid(dose_tensor, minimum_cutoff, restore_cropper, sample, original_image):
     """Identical to docker/process.py's version -- see that module for the
     full rationale (fast center-alignment restore path vs. general
-    sitk.Resample fallback)."""
+    sitk.Resample fallback). Returns a bare (D, H, W) numpy array, not an
+    sitk.Image -- see docker/process.py's run() for why (memory: avoids
+    holding one sitk.Image per control point for the whole job)."""
     dose_tensor = torch.where(dose_tensor < minimum_cutoff, torch.zeros_like(dose_tensor), dose_tensor)
     original_shape_zyx = tuple(reversed(original_image.GetSize()))
     spacing_matches = tuple(round(s, 6) for s in sample["ct_spacing"]) == \
@@ -136,21 +138,20 @@ def restore_dose_to_original_grid(dose_tensor, minimum_cutoff, restore_cropper, 
 
     if spacing_matches:
         restored = restore_cropper.restore(dose_tensor.unsqueeze(0), original_shape_zyx).squeeze(0)
-        dose_img = sitk.GetImageFromArray(restored.cpu().numpy())
-        dose_img.CopyInformation(original_image)
-        return dose_img
+        return restored.cpu().numpy()
 
     dose_img = sitk.GetImageFromArray(dose_tensor.cpu().numpy())
     dose_img.SetSpacing(tuple(reversed(sample["ct_spacing"])))
     dose_img.SetOrigin(sample["ct_origin"])
     dose_img.SetDirection(original_image.GetDirection())
-    return sitk.Resample(
+    resampled = sitk.Resample(
         dose_img,
         referenceImage=original_image,
         interpolator=sitk.sitkLinear,
         defaultPixelValue=0.0,
         outputPixelType=sitk.sitkFloat32,
     )
+    return sitk.GetArrayFromImage(resampled)
 
 
 @torch.no_grad()
@@ -168,6 +169,17 @@ def predict_control_point(model, encoder, ct_tensor, beam, cp, device, dose_scal
     return (pred.squeeze(0).squeeze(0) / dose_scale).float()  # (D, H, W), stays on device
 
 
+def _direction_3d_to_4d(direction3):
+    """Extends a 3x3 row-major direction tuple to the 4x4 sitk expects for a
+    4D image -- the extra axis (control point index) is always identity."""
+    return (
+        direction3[0], direction3[1], direction3[2], 0.0,
+        direction3[3], direction3[4], direction3[5], 0.0,
+        direction3[6], direction3[7], direction3[8], 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    )
+
+
 def run(model, cfg, device):
     dcfg = cfg["data"]
     target_shape = tuple(dcfg["target_shape"])
@@ -181,7 +193,46 @@ def run(model, cfg, device):
     print(f"Loaded metadata for {len(metadata)} image(s)")
 
     restore_cropper = CenterCropOrPad(target_shape=target_shape)
-    per_output = [dict() for _ in range(NUM_OUTPUT_FILES)]  # idx_in_output -> sitk.Image
+
+    # See docker/process.py's run() for the full rationale (ported here
+    # unchanged after it broke a real Task 1 submission twice): CP-level
+    # dose maps are streamed to disk per output_file_idx as soon as that
+    # slot's control points are all in, instead of holding the whole job
+    # in memory and building a final JoinSeries. output_file_idx is an
+    # independent routing value, not tied to which input image a control
+    # point came from -- do not group by image.
+    slot_sizes = {}
+    for image_entry in metadata:
+        for beam in image_entry["beams"]:
+            for cp in beam["control_points"]:
+                oi = cp["output_info"]
+                slot_sizes[oi["output_file_idx"]] = max(
+                    slot_sizes.get(oi["output_file_idx"], 0), oi["idx_in_output"] + 1
+                )
+
+    buffers = {}
+    filled = {}
+    buffer_image = {}
+    written_slots = set()
+
+    def flush_slot(output_file_idx):
+        buffer = buffers.pop(output_file_idx)
+        filled.pop(output_file_idx)
+        original_image = buffer_image.pop(output_file_idx)
+        output_dir = OUTPUT_PATH / f"images/stacked-radiation-dose-map-{output_file_idx + 1}"
+        os.makedirs(output_dir, exist_ok=True)
+        # isVector=False required -- GetImageFromArray's default isVector
+        # auto-detection silently treats a 4D array's last axis as vector
+        # components rather than a spatial axis, collapsing the image to
+        # 3D and dropping the control-point axis entirely. Confirmed
+        # empirically against this SimpleITK version.
+        stacked = sitk.GetImageFromArray(buffer, isVector=False)
+        stacked.SetSpacing(tuple(original_image.GetSpacing()) + (1.0,))
+        stacked.SetOrigin(tuple(original_image.GetOrigin()) + (0.0,))
+        stacked.SetDirection(_direction_3d_to_4d(original_image.GetDirection()))
+        sitk.WriteImage(stacked, output_dir / "output.mha", useCompression=False)
+        print(f"Wrote output slot {output_file_idx + 1}: {buffer.shape[0]} slice(s)")
+        written_slots.add(output_file_idx)
 
     for image_entry in metadata:
         image_idx = image_entry["image_file_idx"]
@@ -196,34 +247,38 @@ def run(model, cfg, device):
         encoder = PhotonBeamEncoder(volume_shape, sample["ct_spacing"], sample["ct_origin"])
         encoder.to(device)
 
+        shape_zyx = tuple(reversed(original_image.GetSize()))
         n_beams = len(image_entry["beams"])
         for beam in image_entry["beams"]:
             n_cps = len(beam["control_points"])
             print(f"  Beam: {n_cps} control points")
             for cp in beam["control_points"]:
                 output_info = cp["output_info"]
+                idx = output_info["output_file_idx"]
                 minimum_cutoff = float(output_info["minimum_cutoff"])
                 dose_tensor = predict_control_point(model, encoder, ct_tensor, beam, cp, device, dose_scale, amp)
-                dose_img = restore_dose_to_original_grid(
+                dose_array = restore_dose_to_original_grid(
                     dose_tensor, minimum_cutoff, restore_cropper, sample, original_image
                 )
-                per_output[output_info["output_file_idx"]][output_info["idx_in_output"]] = dose_img
+                if idx not in buffers:
+                    buffers[idx] = np.zeros((slot_sizes[idx], *shape_zyx), dtype=np.float32)
+                    filled[idx] = 0
+                    buffer_image[idx] = original_image
+                buffers[idx][output_info["idx_in_output"]] = dose_array
+                filled[idx] += 1
+                if filled[idx] == slot_sizes[idx]:
+                    flush_slot(idx)
         print(f"Image {image_idx + 1}: {n_beams} beam(s) done")
 
+    for idx in list(buffers.keys()):
+        flush_slot(idx)
+
     for output_index in range(NUM_OUTPUT_FILES):
-        slot = per_output[output_index]
+        if output_index in written_slots:
+            continue
         output_dir = OUTPUT_PATH / f"images/stacked-radiation-dose-map-{output_index + 1}"
         os.makedirs(output_dir, exist_ok=True)
-
-        if not slot:
-            placeholder = sitk.JoinSeries([sitk.Image(1, 1, 1, sitk.sitkFloat32)])
-            sitk.WriteImage(placeholder, output_dir / "output.mha")
-            continue
-
-        stack_size = max(slot) + 1
-        dose_slices = [slot[i] for i in range(stack_size)]
-        stacked = sitk.JoinSeries(dose_slices)
-        sitk.WriteImage(stacked, output_dir / "output.mha", useCompression=False)
-        print(f"Wrote output slot {output_index + 1}: {stack_size} slice(s)")
+        placeholder = sitk.JoinSeries([sitk.Image(1, 1, 1, sitk.sitkFloat32)])
+        sitk.WriteImage(placeholder, output_dir / "output.mha")
 
     return 0
