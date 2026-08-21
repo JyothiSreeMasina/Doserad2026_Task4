@@ -224,7 +224,52 @@ def run(model, cfg, device):
     print(f"Loaded metadata for {len(metadata)} image(s)")
 
     restore_cropper = CenterCropOrPad(target_shape=target_shape)
+
+    # output_file_idx is an independent routing value, NOT tied to which
+    # input image a control point came from -- confirmed against the real
+    # submission-instructions doc after a wrong assumption here caused a
+    # 500 (AssertionError) on a real evaluation. A single image's control
+    # points can be split across several output slots (e.g. one per beam),
+    # so slots have to be tracked by output_file_idx directly rather than
+    # by image. "idx_in_output (0-indexed, contiguous, no gaps)" per the
+    # docs means the max index we see for a slot IS its final stack size,
+    # so a slot is complete (safe to write + free) the instant its last
+    # index is filled -- this still gets the memory win (never holding
+    # more than the in-progress slots' buffers, not the whole job's worth
+    # of every control point) without assuming any particular grouping.
+    slot_sizes = {}
+    for image_entry in metadata:
+        for beam in image_entry["beams"]:
+            for cp in beam["control_points"]:
+                oi = cp["output_info"]
+                slot_sizes[oi["output_file_idx"]] = max(
+                    slot_sizes.get(oi["output_file_idx"], 0), oi["idx_in_output"] + 1
+                )
+
+    buffers = {}        # output_file_idx -> np.ndarray, allocated on first use
+    filled = {}         # output_file_idx -> count of slices written so far
+    buffer_image = {}   # output_file_idx -> the original_image its data came from
     written_slots = set()
+
+    def flush_slot(output_file_idx):
+        buffer = buffers.pop(output_file_idx)
+        filled.pop(output_file_idx)
+        original_image = buffer_image.pop(output_file_idx)
+        output_dir = OUTPUT_PATH / f"images/stacked-radiation-dose-map-{output_file_idx + 1}"
+        os.makedirs(output_dir, exist_ok=True)
+        # isVector=False is required here: GetImageFromArray's default
+        # isVector auto-detection treats a 4D array's last axis as vector
+        # components rather than a spatial/stack axis, silently collapsing
+        # this to a 3D image and dropping the control-point axis entirely
+        # -- confirmed empirically, not documented behavior worth trusting
+        # blindly.
+        stacked = sitk.GetImageFromArray(buffer, isVector=False)
+        stacked.SetSpacing(tuple(original_image.GetSpacing()) + (1.0,))
+        stacked.SetOrigin(tuple(original_image.GetOrigin()) + (0.0,))
+        stacked.SetDirection(_direction_3d_to_4d(original_image.GetDirection()))
+        sitk.WriteImage(stacked, output_dir / "output.mha", useCompression=False)
+        print(f"Wrote output slot {output_file_idx + 1}: {buffer.shape[0]} slice(s)")
+        written_slots.add(output_file_idx)
 
     for image_entry in metadata:
         image_idx = image_entry["image_file_idx"]
@@ -239,53 +284,35 @@ def run(model, cfg, device):
         encoder = PhotonBeamEncoder(volume_shape, sample["ct_spacing"], sample["ct_origin"])
         encoder.to(device)
 
-        all_cps = [(beam, cp) for beam in image_entry["beams"] for cp in beam["control_points"]]
-        # All control points for one image share a single output slot (the
-        # interface is 1 CT image -> 1 stacked dose map) -- preallocate one
-        # buffer sized for the whole beam plan and fill it in place, instead
-        # of keeping one sitk.Image per control point around until a final
-        # JoinSeries (which itself duplicates everything again into a new
-        # buffer). A real plan can have 100+ control points; holding them
-        # all at once was OOM-killing the container on large plans (see
-        # PROGRESS_LOG.md) even though our own 4-CP local test never hit it.
-        output_file_idx = all_cps[0][1]["output_info"]["output_file_idx"]
-        for _, cp in all_cps:
-            assert cp["output_info"]["output_file_idx"] == output_file_idx, \
-                "expected every control point for one image to share one output slot"
-        stack_size = max(cp["output_info"]["idx_in_output"] for _, cp in all_cps) + 1
         shape_zyx = tuple(reversed(original_image.GetSize()))
-        buffer = np.zeros((stack_size, *shape_zyx), dtype=np.float32)
-
         n_beams = len(image_entry["beams"])
         for beam in image_entry["beams"]:
             n_cps = len(beam["control_points"])
             print(f"  Beam: {n_cps} control points")
             for cp in beam["control_points"]:
                 output_info = cp["output_info"]
+                idx = output_info["output_file_idx"]
                 minimum_cutoff = float(output_info["minimum_cutoff"])
                 dose_tensor = predict_control_point(model, encoder, ct_tensor, beam, cp, device, dose_scale, amp)
-                buffer[output_info["idx_in_output"]] = restore_dose_to_original_grid(
+                dose_array = restore_dose_to_original_grid(
                     dose_tensor, minimum_cutoff, restore_cropper, sample, original_image
                 )
+                if idx not in buffers:
+                    buffers[idx] = np.zeros((slot_sizes[idx], *shape_zyx), dtype=np.float32)
+                    filled[idx] = 0
+                    buffer_image[idx] = original_image
+                buffers[idx][output_info["idx_in_output"]] = dose_array
+                filled[idx] += 1
+                if filled[idx] == slot_sizes[idx]:
+                    flush_slot(idx)
         print(f"Image {image_idx + 1}: {n_beams} beam(s) done")
 
-        output_dir = OUTPUT_PATH / f"images/stacked-radiation-dose-map-{output_file_idx + 1}"
-        os.makedirs(output_dir, exist_ok=True)
-        # isVector=False is required here: GetImageFromArray's default
-        # isVector auto-detection treats a 4D array's last axis as vector
-        # components rather than a spatial/stack axis, silently collapsing
-        # this to a 3D image and dropping the control-point axis entirely
-        # -- confirmed empirically, not documented behavior worth trusting
-        # blindly.
-        stacked = sitk.GetImageFromArray(buffer, isVector=False)
-        del buffer
-        stacked.SetSpacing(tuple(original_image.GetSpacing()) + (1.0,))
-        stacked.SetOrigin(tuple(original_image.GetOrigin()) + (0.0,))
-        stacked.SetDirection(_direction_3d_to_4d(original_image.GetDirection()))
-        sitk.WriteImage(stacked, output_dir / "output.mha", useCompression=False)
-        print(f"Wrote output slot {output_file_idx + 1}: {stack_size} slice(s)")
-        del stacked
-        written_slots.add(output_file_idx)
+    # Defensive fallback -- shouldn't trigger given the "no gaps" contract,
+    # but if a slot's control points ever arrive out of the order that
+    # guarantee implies, this still gets it written instead of silently
+    # dropped.
+    for idx in list(buffers.keys()):
+        flush_slot(idx)
 
     for output_index in range(NUM_OUTPUT_FILES):
         if output_index in written_slots:
