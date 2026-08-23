@@ -52,6 +52,41 @@ class PhotonBeamEncoder:
 
     LEAF_WIDTH_MM = 5.0  # Elekta Agility 160-leaf MLC, standard leaf width at isocenter
     NUM_LEAVES = 80
+    # Softens the aperture edge instead of a hard 0/1 cutoff, approximating
+    # real beam penumbra (scatter/collimator edge falloff, which the
+    # original binary mask ignored entirely -- a deliberate simplification
+    # noted in this class's own docstring). sigmoid((x-edge)/sigma) has its
+    # ~10-90% transition over about 4.4*sigma; 1.5mm here gives roughly a
+    # 6-7mm transition width, in the neighborhood of typical clinical
+    # photon penumbra (commonly cited ~5mm 80/20 width for 6MV at depth) --
+    # a reasonable starting point, not a fitted clinical value. Added after
+    # a real Preliminary Testing Phase submission (both Task 1 and Task 2,
+    # which share this encoder) scored ~24-80 percentage points behind the
+    # field specifically on Local Gamma Index -- the metric most sensitive
+    # to dose-gradient/edge shape, which a hard binary mask can't represent
+    # well regardless of how well the network is trained on top of it.
+    PENUMBRA_SIGMA_MM = 1.5
+    # Exponential depth-in-tissue attenuation, applied on top of the
+    # aperture mask -- previously the mask was flat (1.0) at every depth
+    # within the open aperture, giving the network zero built-in signal
+    # about how primary beam intensity actually falls off with depth. The
+    # Proton encoder already models this properly (range-energy physics);
+    # the Photon encoder had no equivalent, despite real clinical photon
+    # beams also attenuating roughly exponentially past the buildup
+    # region. 0.0035/mm (~3.5%/cm) is a representative broad-beam
+    # megavoltage falloff rate (typical clinical linac energies, e.g.
+    # 6-10MV, commonly fall in the ~3-5%/cm range) -- an approximation,
+    # not derived from a real per-beam energy, since the challenge JSON
+    # doesn't provide one for photon beams (unlike proton's per-beamlet
+    # `energy` field). Depth is measured from body entry, not from the
+    # source -- attenuating from the source would incorrectly treat the
+    # ~700-900mm of air between source and skin as attenuating tissue,
+    # which would wrongly crush the mask near the skin surface. Added
+    # after the penumbra-softening experiment alone produced only a
+    # marginal Gamma Index improvement (2.96%->3.17% on a local spot
+    # check) -- see PROGRESS_LOG.md.
+    MU_EFF_PER_MM = 0.0035
+    NEAR_AXIS_MM = 2.0  # lateral/cc tolerance for "on the central axis" when finding body entry depth
 
     def __init__(self, volume_shape, voxel_spacing, origin, rotation_sign=-1.0):
         """
@@ -132,18 +167,46 @@ class PhotonBeamEncoder:
         rel, beam_axis, _, _, _ = self._beam_geometry(beam_params)
         return (rel * beam_axis).sum(-1)
 
+    def _entry_depth(self, t, lateral, cc, body_mask):
+        """Depth (mm from source) where the central beam axis first crosses
+        into the body -- mirrors ProtonBeamEncoder._entry_depth(), but
+        photon's full divergent cone (every voxel has its own ray, not one
+        ray per beamlet) makes an exact per-voxel entry point expensive to
+        compute; this uses a single representative entry depth from the
+        central axis (lateral~=0, cc~=0) for the whole beam instead. A
+        deliberate coarse approximation -- consistent with this class's own
+        "coarse geometric prior" framing -- not per-column exact. Falls
+        back to depth=0 if no body-mask voxel is found near the central
+        axis, degrading gracefully to source-relative depth rather than
+        crashing.
+        """
+        near_axis = (lateral.abs() < self.NEAR_AXIS_MM) & (cc.abs() < self.NEAR_AXIS_MM)
+        body = body_mask.to(torch.bool)
+        if body.dim() == 4:
+            body = body.squeeze(0)
+        valid = near_axis & body & (t > 0)
+        if valid.any():
+            return t[valid].min()
+        return torch.zeros((), device=t.device)
+
     def encode(self, beam_params, body_mask=None):
         """
         Args:
             beam_params: dict with 'gantry_angle', 'iso_center' (3,), 'SAD',
                 'mlc_left_int_mm' (80,), 'mlc_right_int_mm' (80,) -- the flat
                 per-control-point dict produced by DoseRAD2026Dataset.
-            body_mask: unused -- accepted only so callers can invoke
-                PhotonBeamEncoder and ProtonBeamEncoder through the same
-                signature (ProtonBeamEncoder needs it, this doesn't).
+            body_mask: (1, D, H, W) or (D, H, W) tensor from BodyMask/
+                BodyMaskMR, same volume as this encoder's coordinate grid.
+                Used for the depth-attenuation entry point (see
+                MU_EFF_PER_MM docstring above) -- degrades gracefully to
+                source-relative depth if omitted, so existing callers that
+                don't pass it don't crash, they just get the coarser
+                (pre-attenuation-fix) behavior.
 
         Returns:
-            torch.Tensor: (1, D, H, W) binary aperture mask.
+            torch.Tensor: (1, D, H, W) aperture mask, softened at the edges
+            (see PENUMBRA_SIGMA_MM below) and attenuated with depth-in-body
+            (see MU_EFF_PER_MM below), rather than a flat 0/1 mask.
         """
         rel, beam_axis, leaf_motion_axis, leaf_stack_axis, sad = self._beam_geometry(beam_params)
 
@@ -170,8 +233,39 @@ class PhotonBeamEncoder:
         # inverted (invalid) [right, left] range for ~9% of real
         # leaf/control-point entries, vs ~0.02% using the raw values
         # directly. See PROGRESS_LOG.md for the numbers.
-        in_aperture = (lateral_iso >= left_at_voxel) & (lateral_iso <= right_at_voxel)
-        mask = (valid_leaf & in_aperture).float().unsqueeze(0)
+        #
+        # Soft aperture edge (see PENUMBRA_SIGMA_MM docstring above) instead
+        # of a hard boolean cutoff: sigmoid rising through `left_at_voxel`
+        # times sigmoid falling through `right_at_voxel` gives ~1.0 deep
+        # inside the open aperture, ~0.0 well outside it, and a smooth
+        # transition of ~PENUMBRA_SIGMA_MM's width at each edge.
+        #
+        # .float() (float32) is required here: lateral_iso inherits float64
+        # from beam_axis/leaf_motion_axis, which are built from np.sin/cos
+        # on a numpy float64 scalar in _beam_geometry() -- a pre-existing
+        # latent issue the original hard-boolean-cutoff code never hit,
+        # since a comparison's bool output is dtype-independent and got
+        # cast to float32 right at the end regardless. Real arithmetic
+        # (sigmoid) has no such accidental cast, so without this the model
+        # receives a float64 input channel next to its float32/float16
+        # (autocast) ones and crashes on the first conv -- confirmed via a
+        # real crash during this exact fine-tune.
+        in_aperture = torch.sigmoid(((lateral_iso - left_at_voxel) / self.PENUMBRA_SIGMA_MM).float()) * \
+            torch.sigmoid(((right_at_voxel - lateral_iso) / self.PENUMBRA_SIGMA_MM).float())
+
+        # Depth-in-tissue attenuation (see MU_EFF_PER_MM docstring above).
+        # entry_depth is a single representative value for the whole beam
+        # (see _entry_depth's docstring on why), so this is cheap: one
+        # scalar subtraction against the already-computed `t` grid, not a
+        # per-voxel search.
+        if body_mask is not None:
+            entry_depth = self._entry_depth(t, lateral, cc, body_mask)
+            in_body_depth = torch.clamp(t.float() - entry_depth.float(), min=0.0)
+            attenuation = torch.exp(-self.MU_EFF_PER_MM * in_body_depth)
+        else:
+            attenuation = 1.0
+
+        mask = (valid_leaf.float() * in_aperture * attenuation).unsqueeze(0)
         return mask
 
 

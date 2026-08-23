@@ -85,7 +85,8 @@ def evaluate(model, dataset, val_ids, device, high_dose_frac=0.1,
             encoder = encoder_cache[pid]
 
             beam_params = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in sample["beam_params"].items()}
-            beam_mask = encoder.encode(beam_params).unsqueeze(0)
+            body_mask = sample["body_mask"].to(device)
+            beam_mask = encoder.encode(beam_params, body_mask=body_mask).unsqueeze(0)
             pred = model(ct, beam_mask).squeeze(0)  # (1, D, H, W)
 
             level1["masked_mae"].append(masked_mae(pred, dose, high_dose_frac=high_dose_frac))

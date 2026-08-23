@@ -87,6 +87,7 @@ def _warmup(model, cfg, device):
     amp = cfg["optim"].get("amp", True)
 
     dummy_ct = torch.zeros((1, 1, *target_shape), device=device)
+    dummy_body_mask = torch.ones((1, *target_shape), device=device)  # matches encode()'s call shape; see body_mask docstring
     encoder = PhotonBeamEncoder(target_shape, target_spacing, origin=(0.0, 0.0, 0.0))
     encoder.to(device)
     dummy_beam_params = {
@@ -99,7 +100,7 @@ def _warmup(model, cfg, device):
 
     with torch.no_grad():
         for _ in range(3):
-            beam_mask = encoder.encode(dummy_beam_params).unsqueeze(0)
+            beam_mask = encoder.encode(dummy_beam_params, body_mask=dummy_body_mask).unsqueeze(0)
             with torch.autocast(device_type="cuda", enabled=(amp and device.type == "cuda")):
                 model(dummy_ct, beam_mask)
     if device.type == "cuda":
@@ -186,7 +187,7 @@ def restore_dose_to_original_grid(dose_tensor, minimum_cutoff, restore_cropper, 
 
 
 @torch.no_grad()
-def predict_control_point(model, encoder, ct_tensor, beam, cp, device, dose_scale, amp):
+def predict_control_point(model, encoder, ct_tensor, body_mask, beam, cp, device, dose_scale, amp):
     beam_params = {
         "gantry_angle": float(cp["gantry_angle"]),
         "iso_center": torch.tensor(beam["iso_center"], dtype=torch.float32, device=device),
@@ -194,7 +195,7 @@ def predict_control_point(model, encoder, ct_tensor, beam, cp, device, dose_scal
         "mlc_left_int_mm": torch.tensor(cp["mlc_left_int_mm"], dtype=torch.float32, device=device),
         "mlc_right_int_mm": torch.tensor(cp["mlc_right_int_mm"], dtype=torch.float32, device=device),
     }
-    beam_mask = encoder.encode(beam_params).unsqueeze(0)
+    beam_mask = encoder.encode(beam_params, body_mask=body_mask).unsqueeze(0)
     with torch.autocast(device_type="cuda", enabled=(amp and device.type == "cuda")):
         pred = model(ct_tensor, beam_mask)
     return (pred.squeeze(0).squeeze(0) / dose_scale).float()  # (D, H, W), stays on device
@@ -279,6 +280,7 @@ def run(model, cfg, device):
 
         sample = preprocess_ct(original_image, target_spacing, target_shape)
         ct_tensor = sample["ct"].unsqueeze(0).to(device)
+        body_mask_tensor = sample["body_mask"].to(device)
 
         volume_shape = tuple(sample["ct"].shape[-3:])
         encoder = PhotonBeamEncoder(volume_shape, sample["ct_spacing"], sample["ct_origin"])
@@ -293,7 +295,9 @@ def run(model, cfg, device):
                 output_info = cp["output_info"]
                 idx = output_info["output_file_idx"]
                 minimum_cutoff = float(output_info["minimum_cutoff"])
-                dose_tensor = predict_control_point(model, encoder, ct_tensor, beam, cp, device, dose_scale, amp)
+                dose_tensor = predict_control_point(
+                    model, encoder, ct_tensor, body_mask_tensor, beam, cp, device, dose_scale, amp
+                )
                 dose_array = restore_dose_to_original_grid(
                     dose_tensor, minimum_cutoff, restore_cropper, sample, original_image
                 )
