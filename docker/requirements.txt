@@ -1,6 +1,0 @@
-fastapi
-uvicorn
-SimpleITK
-monai
-pyyaml
-numpy
