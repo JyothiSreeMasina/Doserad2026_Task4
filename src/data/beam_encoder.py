@@ -1,5 +1,14 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
+
+# Must match src/data/transforms.py's NormalizeCT defaults (hu_min=-1000.0,
+# hu_max=3000.0) -- used to invert the [0,1] normalization so
+# ProtonBeamEncoder can recover real HU values from the same `ct` tensor
+# the model sees, without threading a second raw-HU tensor through the
+# whole dataset/trainer/process.py pipeline.
+_CT_NORM_HU_MIN = -1000.0
+_CT_NORM_HU_MAX = 3000.0
 
 
 class PhotonBeamEncoder:
@@ -189,7 +198,7 @@ class PhotonBeamEncoder:
             return t[valid].min()
         return torch.zeros((), device=t.device)
 
-    def encode(self, beam_params, body_mask=None):
+    def encode(self, beam_params, body_mask=None, ct=None):
         """
         Args:
             beam_params: dict with 'gantry_angle', 'iso_center' (3,), 'SAD',
@@ -202,6 +211,10 @@ class PhotonBeamEncoder:
                 source-relative depth if omitted, so existing callers that
                 don't pass it don't crash, they just get the coarser
                 (pre-attenuation-fix) behavior.
+            ct: unused -- accepted only so call sites can pass `ct=...`
+                uniformly across both encoder classes (ProtonBeamEncoder
+                uses it for water-equivalent-path-length range correction;
+                photon has no equivalent CT-density-dependent step here).
 
         Returns:
             torch.Tensor: (1, D, H, W) aperture mask, softened at the edges
@@ -332,6 +345,17 @@ class ProtonBeamEncoder:
     WATER_X0_MM = 360.8        # radiation length of water
     PROTON_MASS_MEV = 938.272  # proton rest mass energy
     NEAR_AXIS_MM = 2.0         # lateral tolerance for "on the ray" when ray-marching for body entry
+    # Water-equivalent-path-length (WEPL) range correction (see encode()'s
+    # `ct` docstring and _water_equivalent_peak_depth below): how far past
+    # body entry to sample CT density looking for the Bragg peak, and the
+    # sampling step. 350mm comfortably covers the reference doc's stated
+    # 31.7-200.8 MeV energy range (water range ~100-260mm via
+    # _range_mm) even after a real tissue path stretches the geometric
+    # depth needed (denser-than-water tissue only shortens it; less-dense
+    # tissue like lung lengthens it, which is the main case this margin is
+    # for).
+    WEPL_MAX_DEPTH_MM = 350.0
+    WEPL_STEP_MM = 1.0
 
     def __init__(self, volume_shape, voxel_spacing, origin):
         """
@@ -413,7 +437,120 @@ class ProtonBeamEncoder:
             return depth[valid].min()
         return torch.zeros((), device=depth.device)
 
-    def encode(self, beam_params, body_mask=None):
+    def _ray_axis(self, beam_params, device):
+        source = torch.as_tensor(beam_params["ray_source"], dtype=torch.float32, device=device)
+        target = torch.as_tensor(beam_params["ray_target"], dtype=torch.float32, device=device)
+        axis = target - source
+        axis = axis / axis.norm()
+        return source, axis
+
+    def beam_depth(self, beam_params):
+        """Per-voxel depth (mm) along the ray's central axis from
+        ray_source. Exposed for src/evaluation/metrics.py's IDD Curve
+        Distance metric -- mirrors PhotonBeamEncoder.beam_depth()."""
+        device = self._coords_xyz.device
+        source, axis = self._ray_axis(beam_params, device)
+        rel = self._coords_xyz - (source - self.origin)
+        return (rel * axis).sum(-1)
+
+    @staticmethod
+    def _hu_to_rsp(hu):
+        """Coarse HU -> relative (to water) proton stopping power (RSP)
+        approximation -- a simple two-segment linear fit, not a full
+        Schneider-et-al piecewise calibration, consistent with this class's
+        "coarse physical prior" framing (see class docstring). Roughly:
+        air (HU=-1000) -> RSP~0, lung (HU~-500) -> RSP~0.5, water (HU=0) ->
+        RSP=1.0, bone (HU~1000) -> RSP~1.5 -- matches the typical shape of
+        a real HU/RSP calibration curve (steeper below water, shallower
+        above, since bone's RSP-per-HU is lower due to its higher effective
+        atomic number) without fitting to a specific scanner/phantom.
+        """
+        below = 1.0 + hu / 1000.0
+        above = 1.0 + hu / 2000.0
+        return torch.clamp(torch.where(hu < 0, below, above), min=0.0)
+
+    def _physical_to_normalized(self, points_xyz):
+        """Converts origin-free physical mm coordinates (x,y,z) to
+        F.grid_sample's [-1,1] normalized coordinate convention
+        (align_corners=True), in the (x,y,z) order grid_sample expects for
+        a 5D (N,C,D,H,W) volume's sampling grid."""
+        d, h, w = self.volume_shape
+        dz, dy, dx = self.voxel_spacing
+        ix = points_xyz[:, 0] / dx
+        iy = points_xyz[:, 1] / dy
+        iz = points_xyz[:, 2] / dz
+        nx = ix / max(w - 1, 1) * 2 - 1
+        ny = iy / max(h - 1, 1) * 2 - 1
+        nz = iz / max(d - 1, 1) * 2 - 1
+        return torch.stack([nx, ny, nz], dim=-1)
+
+    def _water_equivalent_peak_depth(self, ct, source_of, axis, entry_depth, r, device):
+        """Finds the geometric depth (mm from ray_source) at which the
+        cumulative water-equivalent path length (WEPL) from body entry
+        equals the Bragg-Kleeman range `r` (itself water-equivalent by
+        construction) -- i.e. corrects the water-only range assumption for
+        this ray's real tissue density, using the CT image.
+
+        Real tissue isn't water: bone/lung/soft-tissue all have different
+        proton stopping powers, so a ray crossing e.g. lung needs to travel
+        further geometrically to deposit the same water-equivalent range
+        than one crossing only soft tissue. This samples HU every
+        WEPL_STEP_MM along the ray (trilinear via F.grid_sample), converts
+        to relative stopping power (_hu_to_rsp), and cumulative-sums to get
+        WEPL as a function of geometric depth -- then inverts (via
+        searchsorted, since WEPL is monotonically nondecreasing as long as
+        RSP>=0, which _hu_to_rsp clamps to) to find where WEPL == r.
+
+        `ct` must be the same [0,1]-normalized CT tensor the model sees
+        (NormalizeCT convention) -- converted back to HU internally via the
+        module-level _CT_NORM_HU_MIN/MAX constants.
+        """
+        if ct.dim() == 4:
+            ct = ct.squeeze(0)
+        n_steps = max(int(self.WEPL_MAX_DEPTH_MM / self.WEPL_STEP_MM), 2)
+        steps = torch.arange(n_steps, device=device, dtype=torch.float32) * self.WEPL_STEP_MM
+        geo_depths = entry_depth + steps  # (n_steps,)
+        points = source_of.unsqueeze(0) + geo_depths.unsqueeze(-1) * axis.unsqueeze(0)  # (n_steps, 3) xyz
+
+        grid = self._physical_to_normalized(points).view(1, 1, 1, -1, 3)
+        vol = ct.to(device=device, dtype=torch.float32).view(1, 1, *self.volume_shape)
+        # padding_mode="border": a ray step landing just outside the FOV
+        # clamps to the nearest edge voxel instead of a synthetic
+        # zero/air jump, which would otherwise falsely stall WEPL
+        # accumulation right at the volume boundary.
+        sampled = F.grid_sample(vol, grid, mode="bilinear", align_corners=True, padding_mode="border")
+        ct_norm = sampled.view(-1)  # [0,1], NormalizeCT convention
+
+        hu = ct_norm * (_CT_NORM_HU_MAX - _CT_NORM_HU_MIN) + _CT_NORM_HU_MIN
+        rsp = self._hu_to_rsp(hu)
+        wepl = torch.cumsum(rsp, dim=0) * self.WEPL_STEP_MM  # (n_steps,), monotonically nondecreasing
+
+        r_t = torch.as_tensor([float(r)], device=device)
+        # If this ray's real WEPL never reaches `r` within WEPL_MAX_DEPTH_MM
+        # (beam exits the body -- or crosses a large air pocket -- before
+        # accumulating enough water-equivalent path), searchsorted would
+        # otherwise clamp to the last sampled index, i.e. entry_depth +
+        # (WEPL_MAX_DEPTH_MM - WEPL_STEP_MM) -- a fixed ~349mm-past-entry
+        # placement with no relation to `r`, regardless of how close wepl
+        # got. Confirmed via a real beamlet (energy=192.9MeV, r=244mm,
+        # patient's own tissue only offered ~230mm of WEPL before the ray
+        # exited into air on the far side): this fallback put peak_depth
+        # 105mm past the water-only estimate and 121mm past the true MC
+        # dose peak (vs. water-only's 16mm error on the same beamlet) --
+        # the single worst outlier in a 60-beamlet spot check, and the main
+        # driver of a fine-tune that made validation loss *worse* than the
+        # pre-WEPL checkpoint. Falling back to the water-only estimate in
+        # this case is strictly safer: it's the already-validated prior
+        # behavior (3-17mm peak error on real data, PROGRESS_LOG.md),
+        # applied only in exactly the cases where the WEPL sample window
+        # can't answer the question at all.
+        never_reached = wepl[-1] < r_t
+        idx = torch.searchsorted(wepl, r_t).clamp(max=n_steps - 1)
+        peak_depth = geo_depths[idx].squeeze(0)
+        water_only = entry_depth + r
+        return torch.where(never_reached.squeeze(0), water_only, peak_depth)
+
+    def encode(self, beam_params, body_mask=None, ct=None):
         """
         Args:
             beam_params: dict with 'ray_source' (3,), 'ray_target' (3,),
@@ -423,19 +560,24 @@ class ProtonBeamEncoder:
                 BodyMaskMR, same volume as this encoder's coordinate grid.
                 Required to place the Bragg peak correctly -- see class
                 docstring for why raw source distance doesn't work.
+            ct: (1, D, H, W) or (D, H, W) tensor, the same [0,1]-normalized
+                CT channel the model sees (NormalizeCT convention) --
+                enables the water-equivalent-path-length range correction
+                (see _water_equivalent_peak_depth) instead of assuming the
+                whole path is water. Optional: falls back to the water-only
+                Bragg-Kleeman range (previous behavior, and this class's
+                documented 3-17mm peak-position error) if omitted, so any
+                caller not yet updated to pass it still works.
 
         Returns:
             torch.Tensor: (1, D, H, W) single-Gaussian pencil-beam dose proxy.
         """
         device = self._coords_xyz.device
-        source = torch.as_tensor(beam_params["ray_source"], dtype=torch.float32, device=device)
-        target = torch.as_tensor(beam_params["ray_target"], dtype=torch.float32, device=device)
+        source, axis = self._ray_axis(beam_params, device)
         energy = float(beam_params["energy"])
 
-        axis = target - source
-        axis = axis / axis.norm()
-
-        rel = self._coords_xyz - (source - self.origin)  # (D, H, W, 3), both sides in the origin-free frame
+        source_of = source - self.origin  # origin-free frame, matches _coords_xyz
+        rel = self._coords_xyz - source_of  # (D, H, W, 3)
         depth = (rel * axis).sum(-1)  # along-axis distance from source
         perp = rel - depth.unsqueeze(-1) * axis
         lateral = perp.norm(dim=-1)
@@ -446,7 +588,11 @@ class ProtonBeamEncoder:
         r = self._range_mm(energy)
         sigma_r = self._range_straggling_mm(r)
         sigma_lat = self._highland_sigma_mm(in_patient_depth, energy)
-        peak_depth = entry_depth + r
+
+        if ct is not None:
+            peak_depth = self._water_equivalent_peak_depth(ct, source_of, axis, entry_depth, r, device)
+        else:
+            peak_depth = entry_depth + r
 
         longitudinal = torch.exp(-0.5 * ((depth - peak_depth) / sigma_r) ** 2)
         lateral_falloff = torch.exp(-0.5 * (lateral / sigma_lat) ** 2)

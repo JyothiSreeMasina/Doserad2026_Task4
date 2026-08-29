@@ -20,7 +20,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.data.beam_encoder import PhotonBeamEncoder
+from src.data.beam_encoder import PhotonBeamEncoder, ProtonBeamEncoder
 from src.data.hf_dataset import DoseRAD2026Dataset, split_patient_ids
 from src.data.transforms import BodyMask, BodyMaskMR, CenterCropOrPad, Compose, NormalizeCT, NormalizeMR, ResampleToSpacing, ScaleDose
 from src.evaluation.metrics import gamma_index_3d, idd_curve_distance, masked_mae, stratified_plan_mae
@@ -52,7 +52,8 @@ def _mean_ignore_nan(values):
 
 @torch.no_grad()
 def evaluate(model, dataset, val_ids, device, high_dose_frac=0.1,
-             gamma_dose_percent=1.0, gamma_distance_mm=1.0, cp_stride=1):
+             gamma_dose_percent=1.0, gamma_distance_mm=1.0, cp_stride=1,
+             beam_encoder_cls=PhotonBeamEncoder):
     """Runs Level 1 metrics per control point and Level 2 metrics per
     full-plan (sum of a patient's control-point doses across all beams).
     """
@@ -62,7 +63,11 @@ def evaluate(model, dataset, val_ids, device, high_dose_frac=0.1,
     plans = {}  # patient_id -> {"pred", "target", "spacing"}
 
     by_patient = defaultdict(list)
-    for i, (pid, beam_idx, cp_idx) in enumerate(dataset.index):
+    # index entries are (pid, beam_idx, cp_idx) for photon or
+    # (pid, beam_idx, ray_idx, bl_idx) for proton -- pid is always first,
+    # rest is opaque here (dataset[i] re-derives whatever it needs).
+    for i, entry in enumerate(dataset.index):
+        pid = entry[0]
         if pid in val_ids:
             by_patient[pid].append(i)
 
@@ -79,14 +84,14 @@ def evaluate(model, dataset, val_ids, device, high_dose_frac=0.1,
 
             if pid not in encoder_cache:
                 volume_shape = tuple(sample["ct"].shape[-3:])
-                enc = PhotonBeamEncoder(volume_shape, sample["ct_spacing"], sample["ct_origin"])
+                enc = beam_encoder_cls(volume_shape, sample["ct_spacing"], sample["ct_origin"])
                 enc.to(device)
                 encoder_cache[pid] = enc
             encoder = encoder_cache[pid]
 
             beam_params = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in sample["beam_params"].items()}
             body_mask = sample["body_mask"].to(device)
-            beam_mask = encoder.encode(beam_params, body_mask=body_mask).unsqueeze(0)
+            beam_mask = encoder.encode(beam_params, body_mask=body_mask, ct=ct[0]).unsqueeze(0)
             pred = model(ct, beam_mask).squeeze(0)  # (1, D, H, W)
 
             level1["masked_mae"].append(masked_mae(pred, dose, high_dose_frac=high_dose_frac))
@@ -139,9 +144,11 @@ def main():
     model.load_state_dict(state["model_state"])
     print(f"Loaded checkpoint from epoch {state['epoch']}")
 
+    beam_encoder_cls = ProtonBeamEncoder if cfg["data"].get("task") == "proton" else PhotonBeamEncoder
     summary = evaluate(
         model, dataset, val_ids, device,
         high_dose_frac=cfg["loss"]["high_dose_frac"], cp_stride=args.cp_stride,
+        beam_encoder_cls=beam_encoder_cls,
     )
 
     print("\n=== Validation metrics ===")

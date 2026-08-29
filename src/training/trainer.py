@@ -85,7 +85,7 @@ class Trainer:
 
         encoder = self._get_encoder(sample)
         beam_params = self._beam_params_to_device(sample["beam_params"])
-        beam_mask = encoder.encode(beam_params, body_mask=body_mask[0]).unsqueeze(0)  # (1, 1, D, H, W)
+        beam_mask = encoder.encode(beam_params, body_mask=body_mask[0], ct=ct[0]).unsqueeze(0)  # (1, 1, D, H, W)
 
         with torch.autocast(device_type="cuda", enabled=self.amp):
             pred = self.model(ct, beam_mask)
